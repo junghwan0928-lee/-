@@ -1,1 +1,2 @@
-반도체 센서 프로젝트 코드 저장소
+Revision History
+1. 1000Torr_rev0.6 Default
