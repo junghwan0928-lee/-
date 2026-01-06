@@ -1,0 +1,1519 @@
+// Feed Back 출력 저항 배수 2배 고정
+// offset 자동보정 알고리즘 (DAC 자체 출력 1v 기준 CAL 하고 OFFSET 적용 + OFFSET 증폭(저전압 구간 매칭)) 
+// 책임님 의견 반영 (미디안 5 + 초기 Counts 제거 + 비트수 조절)
+
+
+
+/* =================================================================
+ * Vacuum – SGM52410S(ADC on SPI1) + DAC(SPI2) – 0.1~1000 Torr → 0.001~10 V
+ *  - ADC: SGM52410S, SPI1, Mode-1 (CPOL=0, CPHA=1), DOUT/NDRDY=RA0/RB9
+ *  - DAC: (기존 보드) SPI2, VREF ≈ 2.5V (예제), OPAMP x4 → ≈10V FS
+ *  - 최종(오앰프) 출력 매핑: Vout[V] = 0.01 × Torr
+ *  - LUT: SGM(2.048V/24b) 기준 24bit DEC ↔ Torr (현재는 임시 1점)
+ * ================================================================= */
+
+#include "mcc_generated_files/system.h"
+#include "mcc_generated_files/uart1.h"
+#include "mcc_generated_files/i2c1.h"   // SHT31
+#include "mcc_generated_files/spi1.h"   // ADC(SGM) = SPI1
+#include "mcc_generated_files/spi2.h"   // DAC      = SPI2
+
+#include <xc.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <math.h>
+#include <string.h>
+#include <stdarg.h>
+
+#define FCY 3685000UL
+#include <libpic30.h>
+
+
+/* =================================================================
+ * DAC/OPAMP/Torr 설정
+ * ================================================================= */
+#define VREF_MV                  2500u
+#define OPAMP_GAIN               4.000f
+#define VREF_V                   ((float)VREF_MV / 1000.0f)
+
+/* 부팅 직후 DAC 하드웨어 점검(멀티미터 확인), -1이면 비활성 */
+#define DAC_BOOT_TEST_MV         -1
+
+/* 최종 출력 스케일: Vout[V] = 0.01 × 1000Torr */
+#define TORR_TO_OPAMP_V_PER_TORR    0.01f
+
+/* Torr 허용/클램프 범위 */
+#define TORR_EST_MIN   0.10f
+#define TORR_EST_MAX   1000.0f
+
+#define TORR_DAC_MIN   TORR_EST_MIN
+#define TORR_DAC_MAX   TORR_EST_MAX
+
+/* 샘플링/필터 */
+/* =================================================================
+ * FASA EMA
+ * 상승/하강에 따라 다른 α
+ *“올라갈 땐 빠르게, 내려갈 땐 부드럽게”
+ * 트렌드 방향성에 따른 반응 속도 조절
+ * SRL EMA
+ * 샘플 간 변화량에 상한(SRL_MAX_STEP_COUNTS) 설정
+ *“한 번에 크게 튀는 값”을 강하게 억제 (MEDIAN 필터도 이와 비슷함)
+ * 센서 글리치/스파이크 방어용 
+ * ================================================================= */
+
+#define SAMPLE_PERIOD_MS       100      // 초기 값 Filtering 적용 전 샘플링 수
+#define FILTER_MODE_NONE       0
+#define FILTER_MODE_EMA        1
+#define FILTER_MODE_FASA_EMA   2
+#define FILTER_MODE_SRL_EMA    3
+#ifndef DEC_FILTER_MODE
+#define DEC_FILTER_MODE        FILTER_MODE_FASA_EMA
+#endif
+#define EMA_ALPHA_BASE         0.30f
+#define EMA_ALPHA_UP           0.50f
+#define EMA_ALPHA_DOWN         0.50f
+#define SRL_MAX_STEP_COUNTS    12000
+#define FILTER_DELAY_MS        1000u       // 전원 인가 후 몇초 후에 Filter를 적용할 것인지(1000u = 1초)
+
+/* ============ ADC 비트폭/축소 ============ */
+#define ADC_BITS                24
+
+#define VIEW_BITS_1             22                         
+#define COARSE_SHIFT_1          (ADC_BITS - VIEW_BITS_1)
+
+#define VIEW_BITS_2             20                      
+#define COARSE_SHIFT_2          (ADC_BITS - VIEW_BITS_2)
+
+#define VIEW_BITS_3             16                      
+#define COARSE_SHIFT_3          (ADC_BITS - VIEW_BITS_3)
+
+
+/* 초기 RAW 샘플 버리기 (필터 안정화용) */
+#define RAW_DISCARD_COUNT      3     // 처음 @개 샘플은 출력/보정/로그에 사용하지 않음
+
+/* RAW 입력에 대한 미디언 필터 */
+#define RAW_MEDIAN_ENABLE      1       // 1: 사용, 0: 사용 안 함
+#define RAW_MEDIAN_WINDOW      5       // 3 또는 5 추천 (반드시 홀수)
+
+/* =================================================================
+ * RAW 드리프트 보정 (장시간 같은 Torr/온도에서만 동작)
+ *  - 급격한 변화: 사용자 토르 조작 → 보정 OFF + offset 리셋
+ *  - 서서히 드리프트: 허용 비율(±5%) 넘어가면 time constant 걸고 천천히 보정
+ * ================================================================= */
+#define DRIFT_CORR_ENABLE             0
+
+#define DRIFT_STABLE_TORR_THRESH      0.05f      // Torr 변화 허용 (예: ±0.05 Torr)
+#define DRIFT_STABLE_VOUT_STEP_V      0.05f      // 주기당 출력 변화 50mV 이하면 안정으로 간주
+
+#define DRIFT_STABLE_TIME_MS          (3u*60u*1000u)  // 3분
+
+#define DRIFT_MAX_RATIO               0.05f      // ±5%
+#define DRIFT_CORR_TC_MS              (10u*60u*1000u) // 10분
+
+#define DRIFT_MAX_VDAC_OFFSET         0.05f      // ±50mV
+
+
+/* =================================================================
+ * 메인 출력 피드백(ADC로 재측정하여 DAC offset 보정)  // [FB]
+ * -----------------------------------------------------------------
+ *  - OPAMP 출력: 0~10V
+ *  - 분압 → ADC AIN2(single-ended) 입력
+ *  - 기준은 “최종 output(Vout)” 뿐, DAC/OPAMP 이론치는 참고하지 않음
+ * ================================================================= */
+
+/* 피드백 ADC가 보는 전압을 “최종 output”으로 환산하는 계수
+ *  - 예: 메인 0~10V를 1/2로 나눠 AIN2에 0~5V 넣으면 2.0f (2배수)
+ */
+#define FB_ADC_TO_OPAMP_GAIN         2.00f
+  
+/* -----------------------------------------------------------------
+ * 간단 1V(100 Torr) 기준 offset 캘리브레이션
+ *  - 100 Torr(이론 1V)가 일정 시간 유지되면 그 시점의 오차를
+ *    DAC offset으로 계산해서 0.001~1V(<=100Torr) 구간에 공통 적용
+ * ----------------------------------------------------------------- */
+#define FB_CAL1_ENABLE                 0        // ★ 기존 CAL 방식 비활성화(0으로 끔)
+#define FB_CAL1_REF_TORR               100.0f     // 기준 Torr (1V)
+#define FB_CAL1_REF_TORR_DEBUG         (FB_CAL1_REF_TORR / 100.0f)   // 기준 1V 출력 표시용
+#define FB_CAL1_REF_TORR_TOL           10.0f     // 기준 Torr ± 허용
+#define FB_CAL1_STABLE_TIME_MS         300u     // 이 시간 이상 머무르면 캘리브레이션 실행
+#define FB_CAL1_APPLY_MAX_TORR         100.0f   // 이 Torr 이하 전 구간에 동일 offset 적용
+#define FB_CAL1_MAX_OFFSET_VDAC_ABS    0.01f    // 저압 구간 DAC offset 제한 (V)
+#define FB_CAL1_DEBUG_PRINT            1
+
+/* =================================================================
+ * 부팅 시 0.25V → 1.0V 기준 1점 CAL (DAC 직접 명령)
+ *  - Torr와 무관하게 전압 기준으로만 offset 산출
+ *  - 결과는 0~100Torr 구간 LUT offset에 공통 적용
+ * ================================================================= */
+#define FB_BOOTCAL_ENABLE              0           // 0: 사용 안 함, 1: 사용
+#define FB_BOOTCAL_TARGET_VOUT         1.0f        // 목표 메인 출력 1.0 V
+#define FB_BOOTCAL_DAC_CMD_V          (FB_BOOTCAL_TARGET_VOUT / OPAMP_GAIN) // 0.25 V
+#define FB_BOOTCAL_AVG_COUNT           32           // AIN2 평균 샘플 개수
+#define FB_BOOTCAL_DELAY_MS            100u        // 샘플 사이 간격
+#define FB_BOOTCAL_MAX_OFFSET_VDAC_ABS 0.01f      // 부팅 CAL에서 허용할 최대 DAC offset
+#define FB_BOOTCAL_APPLY_MAX_TORR      100.0f     // 이 Torr 이하 구간에 공통 적용
+
+#define FB_BOOTCAL_OFFSET_SCALE        1.07f      // 0~1사이 평균값 0.5 에 x 1.06 해서 = x 0.53 적용 (평균값 보다 살짝 위)
+
+/* -----------------------------------------------------------------
+ * 데모: 1V -> 0.5V -> 0.1V 출력
+ *  - 개발/테스트용. 필요할 때만 1로 바꿔서 사용
+ * ----------------------------------------------------------------- */
+#define DEMO_OUTPUT_SEQUENCE_ENABLE    0
+#define DEMO_OUTPUT_HOLD_MS            3000u    // 각 단계 유지 시간(ms)
+
+
+/* =================================================================
+ * DEC → Torr LUT (현재는 한 점만 있는 임시 LUT)
+ * ================================================================= */
+typedef struct { int32_t dec; float torr; } DEC2TorrPt;
+
+static const DEC2TorrPt g_decLut[] = {
+    { 10000, 1000.00f },
+};
+
+static const int g_decLutCount =
+    (int)(sizeof(g_decLut) / sizeof(g_decLut[0]));
+
+
+/* =================================================================
+ * 핀 매핑 (보드는 도면 기준)
+ * ================================================================= */
+/* DAC (SPI2) */
+#define DAC_CS_TRIS   TRISBbits.TRISB12
+#define DAC_CS_LAT    LATBbits.LATB12
+
+/* SGM52410S DRDY (활성 Low) – 예제 보드: RB9 */
+#define SGM_DRDY_TRIS   TRISBbits.TRISB9
+#define SGM_DRDY_PORT   PORTBbits.RB9
+
+#define SGM_NCS_TRIS   TRISBbits.TRISB4
+#define SGM_NCS_LAT    LATBbits.LATB4
+
+
+/* =================================================================
+ * LED 핀 (RB13, RB14, RB15)
+ * ================================================================= */
+#define LED2_TRIS   TRISBbits.TRISB13
+#define LED2_LAT    LATBbits.LATB13
+
+#define LED1_TRIS   TRISBbits.TRISB14
+#define LED1_LAT    LATBbits.LATB14
+
+#define LED3_TRIS   TRISBbits.TRISB15
+#define LED3_LAT    LATBbits.LATB15
+
+
+/* =================================================================
+ * LED 제어 유틸
+ * ================================================================= */
+static inline void LED1_On(void)      { LED1_LAT = 1; }
+static inline void LED1_Off(void)     { LED1_LAT = 0; }
+static inline void LED1_Toggle(void)  { LED1_LAT ^= 1; }
+
+static inline void LED2_On(void)      { LED2_LAT = 1; }
+static inline void LED2_Off(void)     { LED2_LAT = 0; }
+static inline void LED2_Toggle(void)  { LED2_LAT ^= 1; }
+
+static inline void LED3_On(void)      { LED3_LAT = 1; }
+static inline void LED3_Off(void)     { LED3_LAT = 0; }
+static inline void LED3_Toggle(void)  { LED3_LAT ^= 1; }
+
+
+/* =================================================================
+ * SHT31 I2C (로그 참고용, 선택)
+ * ================================================================= */
+#define SHT31_ADDR 0x44
+
+static void Read_SHT31(float* temperature, float* humidity)
+{
+    uint8_t cmd[2] = {0x2C, 0x06};
+    I2C1_MESSAGE_STATUS st = I2C1_MESSAGE_PENDING;
+    I2C1_MasterWrite(cmd, 2, SHT31_ADDR, &st);
+    while (st == I2C1_MESSAGE_PENDING) { ; }
+    __delay_ms(20);
+
+    uint8_t buf[6] = {0};
+    st = I2C1_MESSAGE_PENDING;
+    I2C1_MasterRead(buf, 6, SHT31_ADDR, &st);
+    while (st == I2C1_MESSAGE_PENDING) { ; }
+
+    if (st == I2C1_MESSAGE_COMPLETE) {
+        uint16_t rt = ((uint16_t)buf[0] << 8) | buf[1];
+        uint16_t rh = ((uint16_t)buf[3] << 8) | buf[4];
+        *temperature = -45.0f + 175.0f * (rt / 65535.0f);
+        *humidity    = 100.0f * (rh / 65535.0f);
+    } else {
+        *temperature = -999.0f;
+        *humidity    = -999.0f;
+    }
+}
+
+
+/* =================================================================
+ * UART 유틸
+ * ================================================================= */
+static char uart_buffer[512];
+static inline void UART_PrintString(const char* s){ printf("%s", s); }
+static void UART_Printf(const char* fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(uart_buffer, sizeof(uart_buffer), fmt, ap);
+    va_end(ap);
+    printf("%s", uart_buffer);
+}
+
+
+/* =================================================================
+ * 유틸
+ * ================================================================= */
+static inline float clampf(float x, float lo, float hi) {
+    return (x < lo) ? lo : (x > hi) ? hi : x;
+}
+
+
+/* =================================================================
+ * SPI 모드 설정
+ *  - ADC(SGM) : SPI1, Mode-1 (CKP=0, CKE=0, SMP=1)
+ *  - DAC      : SPI2, Mode-0 (CKP=0, CKE=1, SMP=0) → 보드 기본
+ * ================================================================= */
+static inline void SPI1_SetMode(uint8_t ckp, uint8_t cke, uint8_t smp){
+
+#if defined(SPI1STATbits) && defined(SPI1CON1bits) && defined(SPI1BUF)
+    SPI1STATbits.SPIEN = 0;
+    SPI1CON1bits.CKP = ckp; SPI1CON1bits.CKE = cke; SPI1CON1bits.SMP = smp;
+    (void)SPI1BUF; SPI1STATbits.SPIROV = 0; SPI1STATbits.SPIEN = 1;
+#elif defined(SPI1STATLbits) && defined(SPI1CON1Lbits) && defined(SPI1BUFL)
+    SPI1STATLbits.SPIEN = 0;
+    SPI1CON1Lbits.CKP = ckp; SPI1CON1Lbits.CKE = cke; SPI1CON1Lbits.SMP = smp;
+    (void)SPI1BUFL; SPI1STATLbits.SPIROV = 0; SPI1STATLbits.SPIEN = 1;
+#elif defined(SPI1CONbits) && defined(SPI1BUF) && defined(SPI1STATbits)
+    SPI1CONbits.ON = 0;
+    SPI1CONbits.CKP = ckp; SPI1CONbits.CKE = cke; SPI1CONbits.SMP = smp;
+    volatile uint16_t d = SPI1BUF; (void)d; SPI1STATbits.SPIROV = 0; SPI1CONbits.ON = 1;
+#endif
+}
+static inline void SPI1_SetFor_SGM(void){ SPI1_SetMode(0,0,1); }
+
+static inline void SPI2_SetFor_DAC(void){
+#if defined(SPI2STATbits) && defined(SPI2CON1bits) && defined(SPI2BUF)
+    SPI2STATbits.SPIEN = 0;
+    SPI2CON1bits.CKP = 0; SPI2CON1bits.CKE = 1; SPI2CON1bits.SMP = 0;
+    (void)SPI2BUF; SPI2STATbits.SPIROV = 0; SPI2STATbits.SPIEN = 1;
+#elif defined(SPI2STATLbits) && defined(SPI2CON1Lbits) && defined(SPI2BUFL)
+    SPI2STATLbits.SPIEN = 0;
+    SPI2CON1Lbits.CKP = 0; SPI2CON1Lbits.CKE = 1; SPI2CON1Lbits.SMP = 0;
+    (void)SPI2BUFL; SPI2STATLbits.SPIROV = 0; SPI2STATLbits.SPIEN = 1;
+#elif defined(SPI2CONbits) && defined(SPI2BUF) && defined(SPI2STATbits)
+    SPI2CONbits.ON = 0;
+    SPI2CONbits.CKP = 0; SPI2CONbits.CKE = 1; SPI2CONbits.SMP = 0;
+    volatile uint16_t d = SPI2BUF; (void)d; SPI2STATbits.SPIROV = 0; SPI2CONbits.ON = 1;
+#endif
+}
+
+
+/* =================================================================
+ * 선택적 DAC 출력 보정 (구간 gain/offset)
+ *  - gain은 사용 안 함, offset은 캘리브레이션 기반으로 갱신  // [FB]
+ * ================================================================= */
+#define DAC_OUTPUT_GAIN_ENABLE     0
+#define DAC_OUTPUT_OFFSET_ENABLE   1    // ★ offset 항상 사용 (0으로 끄면 LUT offset 전체 비활성)
+
+#define DAC_GAIN_PAIR_COUNT        0
+
+static const float gain_torr_choose[DAC_GAIN_PAIR_COUNT] = { 100.0f };
+static const float gain_torr_gain  [DAC_GAIN_PAIR_COUNT] = { 0.0010f };
+
+#ifndef DAC_OFFSET_PAIR_COUNT
+#define DAC_OFFSET_PAIR_COUNT 30
+#endif
+
+static const float offset_torr_choose[DAC_OFFSET_PAIR_COUNT]   = {
+    0.10f,
+    0.20f,
+    0.30f,
+    0.40f,
+    0.50f,
+    0.60f,
+    0.70f,
+    0.80f,
+    0.90f,
+
+    1.0f,
+    2.0f,
+    3.0f,
+    4.0f,
+    5.0f,
+    6.0f,
+    7.0f,
+    8.0f,
+    9.0f,
+
+    10.0f,
+    50.0f,   // #20
+
+    100.0f,
+    200.0f,
+    300.0f,
+    400.0f,
+    500.0f,
+    600.0f,
+    700.0f,
+    800.0f,
+    900.0f,
+   1000.0f,    // #30
+};
+
+/*  ★ 초기값은 모두 0에서 시작 → 캘리브레이션 결과로 채워나감   */
+static float offset_torr_offset_v[DAC_OFFSET_PAIR_COUNT] = { 0.0f };
+
+
+
+/* =================================================================
+ * DAC Gain/Offset 적용 (gain은 끄고, offset은 LUT + 캘리브레이션)
+ * ================================================================= */
+static inline float apply_dac_gain_offset_selective(
+    float p_torr,
+    float vdac_in,
+    float* gain_out,
+    float* offset_out,
+    int* matched_gain_idx_out,
+    int* matched_offset_idx_out
+){
+    float g = 1.0f, o = 0.0f;
+    int gi=-1, oi=-1;
+
+#if (DAC_OUTPUT_GAIN_ENABLE == 1)
+    for (int i = 0; i < DAC_GAIN_PAIR_COUNT; ++i) {
+        float start = gain_torr_choose[i];
+        float end   = (i+1 < DAC_GAIN_PAIR_COUNT) ? gain_torr_choose[i+1] : TORR_DAC_MAX + 1e-9f;
+        if (p_torr >= start && p_torr < end) { g = gain_torr_gain[i]; gi=i; break; }
+    }
+#endif
+
+#if (DAC_OUTPUT_OFFSET_ENABLE == 1)
+    for (int j = 0; j < DAC_OFFSET_PAIR_COUNT; ++j) {
+        float start = offset_torr_choose[j];
+        float end   = (j+1 < DAC_OFFSET_PAIR_COUNT) ? offset_torr_choose[j+1] : TORR_DAC_MAX + 1e-9f;
+        if (p_torr >= start && p_torr < end) { o = offset_torr_offset_v[j]; oi=j; break; }
+    }
+#endif
+
+    if (gain_out)   *gain_out   = g;
+    if (offset_out) *offset_out = o;
+    if (matched_gain_idx_out)   *matched_gain_idx_out = gi;
+    if (matched_offset_idx_out) *matched_offset_idx_out = oi;
+
+    float v = vdac_in * g + o;
+    if (v < 0.0f) v = 0.0f;
+    const float v_max_safe = VREF_V * (65534.0f / 65535.0f);
+    if (v > v_max_safe) v = v_max_safe;
+    return v;
+}
+
+
+/* =================================================================
+ * DAC (SPI2)
+ * ================================================================= */
+static void DAC_SPI_Init(void)
+{
+    DAC_CS_TRIS = 0;
+    DAC_CS_LAT  = 1;   // 비활성
+}
+static inline void DAC_WriteCode16(uint16_t code)
+{
+    SPI2_SetFor_DAC();
+    DAC_CS_LAT = 0;
+    __delay_us(1);
+    (void)SPI2_Exchange8bit((uint8_t)(code >> 8));
+    (void)SPI2_Exchange8bit((uint8_t)(code & 0xFF));
+    __delay_us(1);
+    DAC_CS_LAT = 1;
+    __delay_us(3);
+}
+static inline uint16_t Dac_code_from_mV(uint16_t vout_mV, uint16_t vref_mV)
+{
+    if (vout_mV >= vref_mV) return 0xFFFFu;
+    uint32_t num = (uint32_t)vout_mV * 65535u + (vref_mV / 2);
+    return (uint16_t)(num / vref_mV);
+}
+static inline void DAC_WriteVoltage_V(float v_out_volt)
+{
+    float v = v_out_volt;
+    if (v < 0.0f) v = 0.0f;
+    const float v_max_safe = VREF_V * (65534.0f / 65535.0f);
+    if (v > v_max_safe) v = v_max_safe;
+    uint32_t code32 = (uint32_t)lrintf((v / VREF_V) * 65535.0f);
+    if (code32 > 0xFFFFu) code32 = 0xFFFFu;
+    DAC_WriteCode16((uint16_t)code32);
+}
+
+
+
+
+/* =================================================================
+ * SGM52410S (ADC on SPI1) – 단발(Single-Shot) 모드로 동작
+ * -----------------------------------------------------------------
+ *  - MUX:
+ *      AIN0-AIN1 : 센서 입력 (diff)
+ *      AIN2-GND  : 메인 출력 피드백 (single)
+ * ================================================================= */
+#define SGM_DR_100SPS                0b100
+#define SGM_PGA_2V048                0b010
+
+#define SGM_MUX_AIN0_AIN1_DIFF       0b000   // AIN0(+) - AIN1(-)
+#define SGM_MUX_AIN2_GND_SINGLE      0b110   // AIN2(+) - GND
+
+#define SGM_PGA                      2.048f  // FSR = ±2.048V
+
+#define SGM_TEMP_ENABLE              1       // 1: 내부 온도센서 원시값까지 로그출력
+
+static uint16_t g_sgm_cfg2 = 0;
+static bool     g_sgm_inited = false;
+
+static uint16_t SGM_BuildConfig1_ADC(uint8_t mux_sel, bool singleShot, bool start_now)
+{
+    uint16_t cfg = 0;
+
+    cfg |= ((uint16_t)(mux_sel & 0x7)        << 12); // MUX[2:0]
+    cfg |= ((uint16_t)(SGM_PGA_2V048 & 0x7)  << 9 ); // PGA[2:0]
+    cfg |= ((uint16_t)(singleShot ? 1u : 0u) << 8 ); // MODE (1 = single-shot)
+    cfg |= ((uint16_t)(SGM_DR_100SPS & 0x7)  << 5 ); // DR[2:0]
+    cfg |= ((uint16_t)0u                     << 4 ); // TS_MODE = 0 (ADC)
+    cfg |= ((uint16_t)1u                     << 3 ); // PULL_UP_EN = 1
+    cfg |= ((uint16_t)0b01u                  << 1 ); // NOP[1:0] = 01 (valid)
+    cfg |= 1u;                                      // D0 = 1 (reserved)
+
+    if (start_now) {
+        cfg |= (1u << 15);                          // SS = 1 → 변환 시작
+    }
+    return cfg;
+}
+
+
+
+
+#if SGM_TEMP_ENABLE
+/* 내부 온도센서용 Config (TS_MODE=1) */
+static uint16_t SGM_BuildConfig1_TS(bool singleShot, bool start_now)
+{
+    uint16_t cfg = 0;
+
+    cfg |= ((uint16_t)0u                  << 12); // MUX는 의미 없음
+    cfg |= ((uint16_t)(SGM_PGA_2V048 & 0x7)<< 9 ); // PGA[2:0]
+    cfg |= ((uint16_t)(singleShot ? 1u:0u)<< 8 ); // MODE
+    cfg |= ((uint16_t)(SGM_DR_100SPS & 0x7)<< 5 ); // DR[2:0]
+    cfg |= ((uint16_t)1u                  << 4 ); // TS_MODE = 1 (내부 온도센서)
+    cfg |= ((uint16_t)1u                  << 3 ); // PULL_UP_EN = 1
+    cfg |= ((uint16_t)0b01u               << 1 ); // NOP
+    cfg |= 1u;
+
+    if (start_now) {
+        cfg |= (1u << 15);
+    }
+    return cfg;
+}
+#endif
+
+static uint16_t SGM_BuildConfig2(void)
+{
+    uint16_t cfg=0;
+    cfg |= (0x4u << 12);  // ID[3:0] = 0100 (default)
+    cfg |= (0x0u << 9 );  // ID_VER[2:0] = 000
+    cfg |= (0b01u<< 7 );  // NOP[1:0] = 01
+    cfg |= (0u    << 4 ); // Reserved
+    cfg |= (0u    << 3 ); // CRC_EN = 0
+    cfg |= (0u    << 1 ); // 50/60[1:0] = 00
+    // D0(RES_FG)는 read-only
+    return cfg;
+}
+
+static void SGM_Transfer64_SPI1(uint16_t cfg1, uint16_t cfg2, uint8_t rx[8])
+{
+    uint8_t tx[8] = {
+        (uint8_t)(cfg1>>8),(uint8_t)cfg1,
+        (uint8_t)(cfg1>>8),(uint8_t)cfg1,
+        (uint8_t)(cfg2>>8),(uint8_t)cfg2,
+        (uint8_t)(cfg2>>8),(uint8_t)cfg2
+    };
+    SPI1_SetFor_SGM();
+    for(int i=0;i<8;i++) rx[i] = SPI1_Exchange8bit(tx[i]);
+}
+
+static bool SGM_Wait_DRDY_Timeout(uint16_t timeout_ms)
+{
+    uint32_t us = (uint32_t)timeout_ms * 1000u;
+    while (SGM_DRDY_PORT != 0 && us--) {
+        __delay_us(1);
+    }
+    return (us > 0);
+}
+
+static inline int32_t signext24(uint32_t w){
+    int32_t v = (int32_t)(w & 0xFFFFFFu);
+    if(v & 0x800000) v |= ~0xFFFFFF;
+    return v;
+}
+
+static void SGM_Init_SingleShot(void)
+{
+    if (g_sgm_inited) return;
+    g_sgm_cfg2 = SGM_BuildConfig2();
+    g_sgm_inited = true;
+}
+
+/* 단일 변환: MUX 선택 후 single-shot 변환 1번 수행 (일반 ADC) */
+static bool SGM_ReadSingle_ADC(uint8_t mux_sel,
+                               int32_t *dec_out,
+                               float   *volts_out)
+{
+    if (!g_sgm_inited) {
+        SGM_Init_SingleShot();
+    }
+
+    uint8_t rx[8];
+
+    /* 1) 변환 시작 (SS=1). 첫 번째 수신 데이터는 이전 결과이므로 버림. */
+    uint16_t cfg_start = SGM_BuildConfig1_ADC(mux_sel, true, true);
+    SGM_Transfer64_SPI1(cfg_start, g_sgm_cfg2, rx);
+
+    /* 2) DRDY Low까지 대기 */
+    if (!SGM_Wait_DRDY_Timeout(50)) {
+        return false;
+    }
+
+    /* 3) 결과 읽기 (SS=0, 다음 변환은 시작하지 않음) */
+    uint16_t cfg_read = SGM_BuildConfig1_ADC(mux_sel, true, false);
+    SGM_Transfer64_SPI1(cfg_read, g_sgm_cfg2, rx);
+
+    /* 4) 24bit ADC 결과 파싱 */
+    uint32_t raw24u = ((uint32_t)rx[0]<<16) | ((uint32_t)rx[1]<<8) | rx[4];
+    int32_t  dec    = signext24(raw24u);
+
+    if (dec_out)   *dec_out   = dec;
+    if (volts_out) *volts_out = dec * (SGM_PGA / 8388608.0f); // ±2.048V / 2^23
+
+    return true;
+}
+
+
+#if SGM_TEMP_ENABLE
+/* 내부 온도센서(보정된 °C 값) 읽기
+ *  - 데이터시트:
+ *    * 14-bit two's complement
+ *    * 24bit 결과의 상위 14bit가 온도 코드
+ *    * 두 바이트(rx[0], rx[1])에서 상위 14bit 사용 (좌측 정렬)
+ *    * 1 LSB = 0.03125°C
+ */
+static bool SGM_Read_Temp(int32_t *dec_out, float *tempC_out)
+{
+    if (!g_sgm_inited) {
+        SGM_Init_SingleShot();
+    }
+
+    uint8_t rx[8];
+
+    /* 1) 온도센서 모드로 변환 시작 */
+    uint16_t cfg_start = SGM_BuildConfig1_TS(true, true);
+    SGM_Transfer64_SPI1(cfg_start, g_sgm_cfg2, rx);
+
+    /* 2) DRDY 대기 */
+    if (!SGM_Wait_DRDY_Timeout(50)) {
+        return false;
+    }
+
+    /* 3) 결과 읽기 */
+    uint16_t cfg_read = SGM_BuildConfig1_TS(true, false);
+    SGM_Transfer64_SPI1(cfg_read, g_sgm_cfg2, rx);
+
+    /* 온도 데이터:
+     *  - 24bit 결과의 상위 14bit가 온도 코드
+     *  - 두 바이트(rx[0], rx[1])에서 상위 14bit → 하위 2bit는 버림
+     */
+    uint16_t raw16     = ((uint16_t)rx[0] << 8) | rx[1];
+    uint16_t code14_u  = (raw16 >> 2);          // 상위 14bit만 남김 (bits 15:2)
+
+    /* 14-bit 두's complement sign-extend */
+    int16_t code14 = (int16_t)code14_u;
+    if (code14 & 0x2000) {                      // bit13가 부호비트
+        code14 |= 0xC000;                       // 상위 2비트(15:14)를 1로 채워서 sign-extend
+    }
+
+    if (dec_out) {
+        *dec_out = (int32_t)code14;             // 원시 온도 코드(14bit sign-extended)
+    }
+
+    if (tempC_out) {
+        /* 1 LSB = 0.03125°C → 실제 온도 */
+        *tempC_out = (float)code14 * 0.03125f;
+    }
+
+    return true;
+}
+#endif
+
+
+
+
+
+/* 선형/로그 보간 선택(기본 선형) */
+#define TORR_INTERP_MODE_LOG     0
+#define TORR_INTERP_MODE_LINEAR  1
+#ifndef TORR_INTERP_MODE
+#define TORR_INTERP_MODE TORR_INTERP_MODE_LINEAR
+#endif
+
+static float estimate_torr_from_dec(int32_t dec)
+{
+    if (g_decLutCount < 2) {
+        return clampf((g_decLutCount>0 ? g_decLut[0].torr : TORR_EST_MIN),
+                      TORR_EST_MIN, TORR_EST_MAX);
+    }
+    for (int i = 0; i < g_decLutCount - 1; ++i) {
+        int32_t d0 = g_decLut[i].dec,   d1 = g_decLut[i+1].dec;
+        float   t0 = g_decLut[i].torr,  t1 = g_decLut[i+1].torr;
+
+        int32_t dmin = (d0 < d1) ? d0 : d1;
+        int32_t dmax = (d0 > d1) ? d0 : d1;
+
+        if (dec >= dmin && dec <= dmax) {
+            int32_t denom = (d1 - d0);
+            if (denom == 0) return clampf(t0, TORR_EST_MIN, TORR_EST_MAX);
+
+            float t = (float)(dec - d0) / (float)denom;
+#if (TORR_INTERP_MODE == TORR_INTERP_MODE_LOG)
+            if (t0 <= 0.0f || t1 <= 0.0f) {
+                float Torr_lin = (1.0f - t) * t0 + t * t1;
+                return clampf(Torr_lin, TORR_EST_MIN, TORR_EST_MAX);
+            }
+            float logT = (1.0f - t) * log10f(t0) + t * log10f(t1);
+            float Torr = powf(10.0f, logT);
+            return clampf(Torr, TORR_EST_MIN, TORR_EST_MAX);
+#else
+            float Torr = (1.0f - t) * t0 + t * t1;
+            return clampf(Torr, TORR_EST_MIN, TORR_EST_MAX);
+#endif
+        }
+    }
+    if ((g_decLut[0].dec < g_decLut[g_decLutCount-1].dec && dec < g_decLut[0].dec) ||
+        (g_decLut[0].dec > g_decLut[g_decLutCount-1].dec && dec > g_decLut[0].dec)) {
+        return clampf(g_decLut[0].torr, TORR_EST_MIN, TORR_EST_MAX);
+    } else {
+        return clampf(g_decLut[g_decLutCount-1].torr, TORR_EST_MIN, TORR_EST_MAX);
+    }
+}
+
+
+/* =================================================================
+ * Torr → DAC 전압 (이론값, offset 적용 전)
+ * ================================================================= */
+static float torr_to_vdac(float p_torr, bool* cl_lo, bool* cl_hi)
+{
+    if (cl_lo) *cl_lo = false;
+    if (cl_hi) *cl_hi = false;
+
+    float p = p_torr;
+    if (p < TORR_DAC_MIN) { p = TORR_DAC_MIN; if (cl_lo) *cl_lo = true; }
+    if (p > TORR_DAC_MAX) { p = TORR_DAC_MAX; if (cl_hi) *cl_hi = true; }
+
+    float vopamp_target = p * TORR_TO_OPAMP_V_PER_TORR; // 0.01 V/Torr
+    float vdac = vopamp_target / OPAMP_GAIN;
+    return clampf(vdac, 0.0f, VREF_V);
+}
+
+
+/* =================================================================
+ * RAW 필터 (미디언 + EMA 조합)
+ * ================================================================= */
+#define DEC_DEADBAND_COUNTS  0
+
+static int32_t  g_dec_ema        = 0;
+static bool     g_dec_emaInit    = false;
+static int32_t  g_dec_lastReturn = 0;
+static bool     g_dec_lastInit   = false;
+static bool     g_filter_active  = false;
+static uint32_t g_elapsed_ms     = 0;
+static uint16_t g_raw_discard_remaining = RAW_DISCARD_COUNT;
+
+#if RAW_MEDIAN_ENABLE
+
+static int32_t g_median_buf[RAW_MEDIAN_WINDOW] = {0};
+static uint8_t g_median_count = 0;
+static uint8_t g_median_idx   = 0;
+
+/* 작은 윈도우(3~5)용 간단 정렬 함수 */
+static void sort_int32_small(int32_t* a, uint8_t n)
+{
+    for (uint8_t i = 0; i < n; ++i) {
+        for (uint8_t j = i + 1; j < n; ++j) {
+            if (a[j] < a[i]) {
+                int32_t tmp = a[i];
+                a[i] = a[j];
+                a[j] = tmp;
+            }
+        }
+    }
+}
+
+static int32_t apply_median_filter(int32_t x)
+{
+    g_median_buf[g_median_idx] = x;
+    g_median_idx++;
+    if (g_median_idx >= RAW_MEDIAN_WINDOW) {
+        g_median_idx = 0;
+    }
+    if (g_median_count < RAW_MEDIAN_WINDOW) {
+        g_median_count++;
+        /* 아직 윈도우가 다 안 찼으면 원본 값 그대로 반환 */
+        return x;
+    }
+
+    int32_t tmp[RAW_MEDIAN_WINDOW];
+    for (uint8_t i = 0; i < RAW_MEDIAN_WINDOW; ++i) {
+        tmp[i] = g_median_buf[i];
+    }
+    sort_int32_small(tmp, RAW_MEDIAN_WINDOW);
+
+    /* 중앙값 반환 */
+    return tmp[RAW_MEDIAN_WINDOW / 2];
+}
+
+#endif
+
+static int32_t filter_dec_core(int32_t x)
+{
+#if (DEC_FILTER_MODE == FILTER_MODE_NONE)
+    return x;
+
+#elif (DEC_FILTER_MODE == FILTER_MODE_EMA)
+    if (!g_dec_emaInit) { g_dec_ema = x; g_dec_emaInit = true; }
+    else {
+        float y = (1.0f - EMA_ALPHA_BASE) * (float)g_dec_ema + EMA_ALPHA_BASE * (float)x;
+        g_dec_ema = (int32_t)lrintf(y);
+    }
+    return g_dec_ema;
+
+#elif (DEC_FILTER_MODE == FILTER_MODE_FASA_EMA)
+    if (!g_dec_emaInit) { g_dec_ema = x; g_dec_emaInit = true; }
+    else {
+        float alpha = (x > g_dec_ema) ? EMA_ALPHA_UP : EMA_ALPHA_DOWN;
+        float y = (1.0f - alpha) * (float)g_dec_ema + alpha * (float)x;
+        g_dec_ema = (int32_t)lrintf(y);
+    }
+    return g_dec_ema;
+
+#elif (DEC_FILTER_MODE == FILTER_MODE_SRL_EMA)
+    if (!g_dec_emaInit) { g_dec_ema = x; g_dec_emaInit = true; }
+    else {
+        int32_t prev = g_dec_ema;
+        int32_t dx   = x - prev;
+        if (dx >  SRL_MAX_STEP_COUNTS) dx =  SRL_MAX_STEP_COUNTS;
+        if (dx < -SRL_MAX_STEP_COUNTS) dx = -SRL_MAX_STEP_COUNTS;
+        int32_t limited = prev + dx;
+        float y = (1.0f - EMA_ALPHA_BASE) * (float)prev + EMA_ALPHA_BASE * (float)limited;
+        g_dec_ema = (int32_t)lrintf(y);
+    }
+    return g_dec_ema;
+#else
+    return x;
+#endif
+}
+
+static int32_t filter_dec_with_delay(int32_t dec_in)
+{
+    if (!g_filter_active) {
+        g_dec_ema        = dec_in;
+        g_dec_emaInit    = true;
+        g_dec_lastReturn = dec_in;
+        g_dec_lastInit   = true;
+        return dec_in;
+    }
+
+    int32_t x = dec_in;
+
+#if RAW_MEDIAN_ENABLE
+    /* 먼저 median 3/5로 스파이크 제거 */
+    x = apply_median_filter(x);
+#endif
+
+    if (g_dec_lastInit) {
+        int32_t d = x - g_dec_lastReturn; if (d < 0) d = -d;
+        if (d <= DEC_DEADBAND_COUNTS) x = g_dec_lastReturn;
+    }
+    int32_t y = filter_dec_core(x);
+    g_dec_lastReturn = y;
+    g_dec_lastInit   = true;
+    return y;
+}
+
+
+/* =================================================================
+ * 전역 상태
+ * ================================================================= */
+static int32_t  g_dec_filt   = 0;
+static float    g_torr_est   = 0.0f;
+
+static bool     g_view_init = false;       
+static int32_t  g_view_ema  = 0;
+
+static bool     g_view2_init = false;      
+static int32_t  g_view2_ema  = 0;       
+
+static bool     g_view3_init = false;       
+static int32_t  g_view3_ema  = 0;           
+
+
+/* 피드백 관련 상태값 */   // [FB]
+static float    g_fb_last_vout       = 0.0f;
+static bool     g_fb_last_valid      = false;
+
+/* 100Torr 1점 캘리브레이션 상태 */   // [CAL1]
+#if FB_CAL1_ENABLE
+static bool     g_cal1_done        = false;
+static uint32_t g_cal1_stable_ms   = 0;
+static float    g_cal1_vdac_offset = 0.0f;   // DAC 전압 기준 offset
+#endif
+
+/* 드리프트 보정 상태 */
+static bool     g_drift_active        = false;
+static float    g_drift_ref_torr      = 0.0f;
+static float    g_drift_ref_vout      = 0.0f;
+static float    g_drift_vdac_offset   = 0.0f;
+static float    g_drift_last_torr     = 0.0f;
+static float    g_drift_last_vout     = 0.0f;
+static bool     g_drift_have_last     = false;
+static uint32_t g_drift_stable_ms     = 0;
+
+
+/* =================================================================
+ * Torr → LUT index 찾기 (offset 테이블용)
+ * ================================================================= */
+static int find_offset_index_for_torr(float p_torr)
+{
+    for (int j = 0; j < DAC_OFFSET_PAIR_COUNT; ++j) {
+        float start = offset_torr_choose[j];
+        float end   = (j+1 < DAC_OFFSET_PAIR_COUNT) ? offset_torr_choose[j+1] : TORR_DAC_MAX + 1e-9f;
+        if (p_torr >= start && p_torr < end) {
+            return j;
+        }
+    }
+    return -1;
+}
+
+
+#if FB_CAL1_ENABLE
+/* =================================================================
+ * 100Torr(1V) 구간에서 1점 캘리브레이션
+ *  - Torr가 100±TOL 범위에 일정 시간 머무르면
+ *    Vout_target - Vout_meas 를 이용해 DAC offset 산출
+ *  - 산출된 offset은 FB_CAL1_APPLY_MAX_TORR(<=100Torr)까지 공통 적용
+ * ================================================================= */
+static void feedback_onepoint_calibration(float p_torr,
+                                          float vout_target,
+                                          bool  fb_ok,
+                                          float vout_meas)
+{
+    if (g_cal1_done) {
+        return;
+    }
+
+    if (!fb_ok) {
+        g_cal1_stable_ms = 0;
+        return;
+    }
+
+    float dtorr = p_torr - FB_CAL1_REF_TORR;
+    if (dtorr < 0.0f) dtorr = -dtorr;
+
+    if (dtorr <= FB_CAL1_REF_TORR_TOL) {
+        if (g_cal1_stable_ms < FB_CAL1_STABLE_TIME_MS) {
+            g_cal1_stable_ms += SAMPLE_PERIOD_MS;
+        }
+
+        if (g_cal1_stable_ms >= FB_CAL1_STABLE_TIME_MS) {
+            float err_vout = vout_target - vout_meas;   // (+)면 출력이 모자람
+            float off_vdac = err_vout / OPAMP_GAIN;     // DAC 전압 기준 보정값
+
+            if (off_vdac >  FB_CAL1_MAX_OFFSET_VDAC_ABS) off_vdac =  FB_CAL1_MAX_OFFSET_VDAC_ABS;
+            if (off_vdac < -FB_CAL1_MAX_OFFSET_VDAC_ABS) off_vdac = -FB_CAL1_MAX_OFFSET_VDAC_ABS;
+
+            g_cal1_vdac_offset = off_vdac;
+            g_cal1_done        = true;
+
+            /* 저압 구간 전체에 동일 offset 적용 */
+            for (int j = 0; j < DAC_OFFSET_PAIR_COUNT; ++j) {
+                if (offset_torr_choose[j] <= FB_CAL1_APPLY_MAX_TORR) {
+                    offset_torr_offset_v[j] = g_cal1_vdac_offset;
+                }
+            }
+
+#if FB_CAL1_DEBUG_PRINT
+            UART_Printf(
+                "\r\n"
+                "[CAL] DONE: Torr=%.3f, Vout_meas=%.6fV, target=%.6fV -> off_dac=%.6fV (<=%.1fTorr)\r\n",
+                (double)p_torr,
+                (double)vout_meas,
+                (double)vout_target,
+                (double)g_cal1_vdac_offset,
+                (double)FB_CAL1_APPLY_MAX_TORR
+            );
+#endif
+        }
+    } else {
+        g_cal1_stable_ms = 0;
+    }
+}
+#endif
+
+
+/* =================================================================
+ * 부팅 시 DAC=0.25V → 메인 출력 1.0V 기준 1점 CAL
+ *  - Torr와 무관, 전압 기준으로만 offset 계산
+ *  - 계산된 offset을 FB_BOOTCAL_APPLY_MAX_TORR 이하 구간 LUT에 공통 적용
+ * ================================================================= */
+static void Feedback_BootCal_1V(void)
+{
+#if FB_BOOTCAL_ENABLE
+
+    /* 0.25V 명령 (OPAMP x4 → 1V 기대) */
+    float v_dac_cmd = clampf(FB_BOOTCAL_DAC_CMD_V, 0.0f, VREF_V);
+    DAC_WriteVoltage_V(v_dac_cmd);
+
+    __delay_ms(500);
+
+    float sum_vout = 0.0f;
+    int   valid    = 0;
+
+    for (int i = 0; i < FB_BOOTCAL_AVG_COUNT; ++i) {
+        int32_t dec_fb   = 0;
+        float   v_adc_fb = 0.0f;
+
+        if (SGM_ReadSingle_ADC(SGM_MUX_AIN2_GND_SINGLE, &dec_fb, &v_adc_fb)) {
+            float vout_meas = v_adc_fb * FB_ADC_TO_OPAMP_GAIN;
+            sum_vout += vout_meas;
+            valid++;
+        }
+
+        __delay_ms(FB_BOOTCAL_DELAY_MS);
+    }
+
+    if (valid > 0) {
+        float vout_avg = sum_vout / (float)valid;
+
+        float err_vout = FB_BOOTCAL_TARGET_VOUT - vout_avg;   // (+)면 출력이 모자람
+        float off_dac  = err_vout / OPAMP_GAIN;               // DAC 전압 기준 offset
+
+        off_dac *= FB_BOOTCAL_OFFSET_SCALE;
+        
+        if (off_dac >  FB_BOOTCAL_MAX_OFFSET_VDAC_ABS) off_dac =  FB_BOOTCAL_MAX_OFFSET_VDAC_ABS;
+        if (off_dac < -FB_BOOTCAL_MAX_OFFSET_VDAC_ABS) off_dac = -FB_BOOTCAL_MAX_OFFSET_VDAC_ABS;
+
+        for (int j = 0; j < DAC_OFFSET_PAIR_COUNT; ++j) {
+            if (offset_torr_choose[j] <= FB_BOOTCAL_APPLY_MAX_TORR) {
+                offset_torr_offset_v[j] = off_dac;
+            }
+        }
+
+        UART_Printf(
+            "\r\n[BOOTCAL] 1V: Vout_avg=%.6fV, target=%.6fV, off_dac=%.6fV (<=%.1fTorr)\r\n",
+            (double)vout_avg,
+            (double)FB_BOOTCAL_TARGET_VOUT,
+            (double)off_dac,
+            (double)FB_BOOTCAL_APPLY_MAX_TORR
+        );
+    } else {
+        UART_PrintString("\r\n[BOOTCAL] FB ADC sample 없음 → CAL 스킵\r\n");
+    }
+
+#endif
+}
+
+
+/* =================================================================
+ * RAW 드리프트 보정 업데이트
+ *  - torr_now, vout_meas: 현재 Torr 추정 / 메인 출력
+ *  - vout_target: 현재 이론적으로 나와야 하는 출력 (Torr 기반)
+ *  - fb_ok: AIN2 피드백 정상 여부
+ * ================================================================= */
+static void drift_correction_update(float torr_now,
+                                    float vout_target,
+                                    bool  fb_ok,
+                                    float vout_meas)
+{
+#if DRIFT_CORR_ENABLE
+
+    if (!fb_ok) {
+        g_drift_active        = false;
+        g_drift_stable_ms     = 0;
+        g_drift_have_last     = false;
+        g_drift_vdac_offset   = 0.0f;
+        return;
+    }
+
+    if (!g_drift_have_last) {
+        g_drift_last_torr = torr_now;
+        g_drift_last_vout = vout_meas;
+        g_drift_have_last = true;
+        g_drift_stable_ms = 0;
+        return;
+    }
+
+    float dtorr = torr_now - g_drift_last_torr;
+    if (dtorr < 0.0f) dtorr = -dtorr;
+
+    float dvout = vout_meas - g_drift_last_vout;
+    if (dvout < 0.0f) dvout = -dvout;
+
+    /* 급격한 변화 → 사용자 토르 조작으로 간주, 드리프트 보정 OFF + offset 리셋 */
+    if (dtorr > DRIFT_STABLE_TORR_THRESH * 5.0f ||
+        dvout > DRIFT_STABLE_VOUT_STEP_V)
+    {
+        g_drift_active        = false;
+        g_drift_stable_ms     = 0;
+        g_drift_vdac_offset   = 0.0f;
+
+        g_drift_ref_torr      = torr_now;
+        g_drift_ref_vout      = vout_meas;
+        g_drift_last_torr     = torr_now;
+        g_drift_last_vout     = vout_meas;
+        return;
+    }
+
+    /* 안정 구간 누적 시간 계산 */
+    if (dtorr < DRIFT_STABLE_TORR_THRESH &&
+        dvout < DRIFT_STABLE_VOUT_STEP_V) {
+        if (g_drift_stable_ms < 0xFFFFFFFFu - SAMPLE_PERIOD_MS) {
+            g_drift_stable_ms += SAMPLE_PERIOD_MS;
+        }
+    } else {
+        g_drift_stable_ms = 0;
+    }
+
+    /* 충분히 안정되면 드리프트 보정 ON */
+    if (!g_drift_active && g_drift_stable_ms >= DRIFT_STABLE_TIME_MS) {
+        g_drift_active        = true;
+        g_drift_ref_torr      = torr_now;
+        g_drift_ref_vout      = vout_meas;
+        g_drift_vdac_offset   = 0.0f;
+    }
+
+    g_drift_last_torr = torr_now;
+    g_drift_last_vout = vout_meas;
+
+    if (!g_drift_active) {
+        return;
+    }
+
+    float ref = g_drift_ref_vout;
+    if (ref < 0.1f) ref = 0.1f;
+
+    float band = ref * DRIFT_MAX_RATIO;
+
+    float err  = vout_meas - g_drift_ref_vout;
+    float sign = (err >= 0.0f) ? 1.0f : -1.0f;
+    float mag  = (err >= 0.0f) ? err : -err;
+
+    if (mag <= band) {
+        return;
+    }
+
+    float err_ex = mag - band;
+
+    float k = (float)SAMPLE_PERIOD_MS / (float)DRIFT_CORR_TC_MS;
+    if (k > 1.0f) k = 1.0f;
+
+    float delta_vdac = (err_ex / OPAMP_GAIN) * k;
+
+    if (sign > 0.0f) {
+        g_drift_vdac_offset -= delta_vdac;
+    } else {
+        g_drift_vdac_offset += delta_vdac;
+    }
+
+    if (g_drift_vdac_offset >  DRIFT_MAX_VDAC_OFFSET) g_drift_vdac_offset =  DRIFT_MAX_VDAC_OFFSET;
+    if (g_drift_vdac_offset < -DRIFT_MAX_VDAC_OFFSET) g_drift_vdac_offset = -DRIFT_MAX_VDAC_OFFSET;
+
+#endif
+}
+
+
+#if DEMO_OUTPUT_SEQUENCE_ENABLE
+/* ================================================================
+ * DEMO : 1V에서 offset 한 번 잡고 → 그 offset 고정한 채
+ *        1V → 0.1V → 0.01V → 0.001V 를 계속 반복 출력
+ * ================================================================ */
+static void DEMO_Output_1V_0p5V_0p1V(void)
+{
+    const float demo_torrs[] = { 100.0f, 1.0f, 0.10f, 100.0f };   // 0.5V, 0.01V, 0.001V(예시)
+    const int   n_demo       = 4;
+
+    /* STEP 0: offset 테이블 초기화 */
+    for (int j = 0; j < DAC_OFFSET_PAIR_COUNT; ++j) {
+        offset_torr_offset_v[j] = 0.0f;
+    }
+
+    /* STEP 1: 1V(100Torr) 출력 (offset=0 상태) */
+    float torr_1v = demo_torrs[0];     // 100Torr
+    bool  cl_lo = false, cl_hi = false;
+
+    float vdac_raw_1v = torr_to_vdac(torr_1v, &cl_lo, &cl_hi);
+
+    float g_dummy = 1.0f, o_dummy = 0.0f;
+    int   gi_dummy = -1, oi_dummy = -1;
+
+    float vdac_1v = apply_dac_gain_offset_selective(
+        torr_1v,
+        vdac_raw_1v,
+        &g_dummy, &o_dummy,
+        &gi_dummy, &oi_dummy
+    );
+
+    DAC_WriteVoltage_V(vdac_1v);
+
+    UART_Printf(
+        "[CAL] 1V pre-output: Torr=%.1f, DAC_raw=%.6fV, DAC=%.6fV, Vout_est=%.6fV\r\n",
+        (double)torr_1v,
+        (double)vdac_raw_1v,
+        (double)vdac_1v,
+        (double)(vdac_1v * OPAMP_GAIN)
+    );
+
+    __delay_ms(DEMO_OUTPUT_HOLD_MS);
+
+    /* STEP 2: 피드백 ADC(AIN2)로 실제 OUTPUT 측정 → 1V 기준 offset 계산 */
+    int32_t dec_fb = 0;
+    float   v_adc_fb = 0.0f;
+
+    if (!SGM_ReadSingle_ADC(SGM_MUX_AIN2_GND_SINGLE, &dec_fb, &v_adc_fb)) {
+        UART_PrintString("[CAL] FB ADC ERROR → offset \r\n");
+        return;
+    }
+
+    float vout_meas   = v_adc_fb * FB_ADC_TO_OPAMP_GAIN;               // 실제 OUTPUT 전압
+    float vout_target = torr_1v * TORR_TO_OPAMP_V_PER_TORR;            // 이론 1.0V
+
+    float err_vout = vout_target - vout_meas;                          // (+)면 출력이 모자람
+    float off_vdac = err_vout / OPAMP_GAIN;                            // DAC 기준 offset
+
+    if (off_vdac >  FB_CAL1_MAX_OFFSET_VDAC_ABS) off_vdac =  FB_CAL1_MAX_OFFSET_VDAC_ABS;
+    if (off_vdac < -FB_CAL1_MAX_OFFSET_VDAC_ABS) off_vdac = -FB_CAL1_MAX_OFFSET_VDAC_ABS;
+
+    /* STEP 3: 0.1~100Torr 구간 전체에 동일 offset 적용 */
+    for (int j = 0; j < DAC_OFFSET_PAIR_COUNT; ++j) {
+        if (offset_torr_choose[j] <= FB_CAL1_APPLY_MAX_TORR) {
+            offset_torr_offset_v[j] = off_vdac;
+        }
+    }
+
+    UART_Printf(
+        "[CAL] 1V offset : Vout_meas=%.6fV, target=%.6fV, off_dac=%.6fV (<=%.1fTorr)\r\n",
+        (double)vout_meas,
+        (double)vout_target,
+        (double)off_vdac,
+        (double)FB_CAL1_APPLY_MAX_TORR
+    );
+
+    /* STEP 4: offset 고정한 상태로 1V→0.5V→0.1V 반복 출력 */
+
+    while (1) {
+        for (int i = 0; i < n_demo; ++i) {
+            float t = demo_torrs[i];
+            bool  lo = false, hi = false;
+
+            float v_raw  = torr_to_vdac(t, &lo, &hi);    // 이론 DAC 전압
+            float g2 = 1.0f, o2 = 0.0f;
+            int   gi2 = -1,  oi2 = -1;
+
+            float v_dac2 = apply_dac_gain_offset_selective(
+                t,
+                v_raw,
+                &g2, &o2,
+                &gi2, &oi2
+            );
+
+            DAC_WriteVoltage_V(v_dac2);
+
+            UART_Printf(
+                "[DEMO] OUT Torr=%.3f → DAC_raw=%.6fV, DAC=%.6fV (off=%.6fV idx=%d) → OUT_est=%.6fV\r\n",
+                (double)t,
+                (double)v_raw,
+                (double)v_dac2,
+                (double)o2,
+                oi2,
+                (double)(v_dac2 * OPAMP_GAIN)
+            );
+
+            __delay_ms(DEMO_OUTPUT_HOLD_MS);
+        }
+    }
+}
+
+#endif
+
+
+/* =================================================================
+ * 측정 루틴(주기: SAMPLE_PERIOD_MS)
+ *  - 1) 센서 ADC (AIN0-AIN1, diff)
+ *  - 2) 메인 출력 피드백 ADC (AIN2-GND, single)
+ *  - 3) 캘리브레이션 기반 offset 갱신 후 DAC 출력
+ * ================================================================= */
+static void process_sensor_measurements(void)
+{
+    /* 1) 센서측 ADC 읽기 */
+    int32_t dec_sensor = 0;
+    float   v_adc_sensor = 0.0f;
+    if (!SGM_ReadSingle_ADC(SGM_MUX_AIN0_AIN1_DIFF, &dec_sensor, &v_adc_sensor)) {
+        UART_PrintString("SGM ADC(sensor) timeout / invalid sample\r\n");
+        return;
+    }
+
+    /* 필터 적용 */
+    g_dec_filt = filter_dec_with_delay(dec_sensor);
+
+    /* 초기 RAW 샘플 N개는 버림 (출력/보정/로그에 사용하지 않음) */
+    if (g_raw_discard_remaining > 0) {
+        g_raw_discard_remaining--;
+        return;
+    }
+
+    /* 사용자 설정 비트 뷰 */
+    int32_t view_raw_1 = (int32_t)(g_dec_filt >> COARSE_SHIFT_1);
+    if (!g_view_init) {
+        g_view_ema = view_raw_1;
+        g_view_init = true;
+    } else {
+        g_view_ema = (int32_t)((1.0f - 0.30f) * (float)g_view_ema + 0.30f * (float)view_raw_1);
+    }
+    int32_t view_filt_1 = (int32_t)lrintf((float)g_view_ema);
+
+    /* 뷰2: 20bit  */
+    int32_t view_raw_2 = (int32_t)(g_dec_filt >> COARSE_SHIFT_2);
+    if (!g_view2_init) {
+        g_view2_ema = view_raw_2;
+        g_view2_init = true;
+    } else {
+        g_view2_ema = (int32_t)((1.0f - 0.30f) * (float)g_view2_ema + 0.30f * (float)view_raw_2);
+    }
+    int32_t view_filt_2 = (int32_t)lrintf((float)g_view2_ema);
+    
+    
+    int32_t view_raw_3 = (int32_t)(g_dec_filt >> COARSE_SHIFT_3);
+    if (!g_view3_init) {
+        g_view3_ema = view_raw_3;
+        g_view3_init = true;
+    } else {
+        g_view3_ema = (int32_t)((1.0f - 0.30f) * (float)g_view3_ema + 0.30f * (float)view_raw_3);
+    }
+    int32_t view_filt_3 = (int32_t)lrintf((float)g_view3_ema);
+
+
+
+    /* DEC → Torr */
+    int32_t dec_for_lut = g_dec_filt;
+    g_torr_est = estimate_torr_from_dec(dec_for_lut);
+
+    /* 이상적인 최종 출력 (목표값, 고객이 보는 전압 기준) */
+    float vout_target = g_torr_est * TORR_TO_OPAMP_V_PER_TORR;
+
+    /* 2) 메인 출력 피드백 한번 측정 */
+    int32_t dec_fb = 0;
+    float   v_adc_fb = 0.0f;
+    bool    fb_ok = SGM_ReadSingle_ADC(SGM_MUX_AIN2_GND_SINGLE, &dec_fb, &v_adc_fb);
+
+    float vout_meas = 0.0f;
+    if (fb_ok) {
+        vout_meas      = v_adc_fb * FB_ADC_TO_OPAMP_GAIN;
+        g_fb_last_vout = vout_meas;
+        g_fb_last_valid= true;
+    } else {
+        g_fb_last_valid = false;
+        UART_PrintString("SGM ADC(feedback) timeout / invalid sample\r\n");
+    }
+
+#if FB_CAL1_ENABLE
+    /* 100Torr 1점 캘리브레이션 (현재는 비활성 상태) */
+    feedback_onepoint_calibration(g_torr_est, vout_target, fb_ok, vout_meas);
+#endif
+
+    /* RAW 장기 드리프트 보정 (안정 Torr 구간에서만 작동) */
+    drift_correction_update(g_torr_est, vout_target, fb_ok, vout_meas);
+
+    /* 3) Torr → DAC (이론값 + offset LUT 적용) */
+    bool  cl_lo = false, cl_hi = false;
+    float v_dac_raw = torr_to_vdac(g_torr_est, &cl_lo, &cl_hi);
+
+    float applied_gain = 1.0f, applied_offs = 0.0f;
+    int   matched_gidx = -1,    matched_oidx = -1;
+
+    float v_dac = apply_dac_gain_offset_selective(
+        g_torr_est,
+        v_dac_raw,
+        &applied_gain, &applied_offs,
+        &matched_gidx, &matched_oidx
+    );
+
+#if DRIFT_CORR_ENABLE
+    /* 드리프트 보정 offset 추가 */
+    v_dac += g_drift_vdac_offset;
+    if (v_dac < 0.0f) v_dac = 0.0f;
+    if (v_dac > VREF_V) v_dac = VREF_V;
+#endif
+
+    DAC_WriteVoltage_V(v_dac);
+
+    /* SHT31 온도/습도 (옵션) */
+    float t_ref = -999.0f, rh_ref = -1.0f;
+    Read_SHT31(&t_ref, &rh_ref);
+
+    /* SGM 내부 온도센서 (원시값) */
+    int32_t dec_temp = 0;
+    float   v_temp   = 0.0f;
+    bool    temp_ok  = false;
+#if SGM_TEMP_ENABLE
+    temp_ok = SGM_Read_Temp(&dec_temp, &v_temp);
+#endif
+
+    /* 1V(100Torr) 구간 offset 값 조회 */
+    int   idx_v = find_offset_index_for_torr(FB_CAL1_REF_TORR);
+    float off_v = 0.0f;
+    if (idx_v >= 0) {
+        off_v = offset_torr_offset_v[idx_v];
+    }
+
+    /* FB 상태 문자열 구성 */
+    const char* fb_valid_str = fb_ok ? "OK" : "NG";
+
+    /* 자동 보정은 제거, CAL 전용 알고리즘 */
+    const char* fb_alg_str = "ONLY";
+
+    const char* fb_cal_str = "NA";
+#if FB_CAL1_ENABLE
+    fb_cal_str = g_cal1_done ? "OK" : "WAIT";
+#endif
+
+    const char* temp_state_str = "DIS";
+#if SGM_TEMP_ENABLE
+    temp_state_str = temp_ok ? "OK" : "NG";
+#endif
+
+    UART_Printf(
+        "\r\n"
+        "\r\n[ADC] Raw24:%ld Filt24:%ld | Raw%d:%ld Filt%d:%ld\r\n"
+        "      Raw%d:%ld Filt%d:%ld | Raw%d:%ld Filt%d:%ld\r\n"
+        "      ADC_Sensor=%.3fmV | DAC Output= %.4fV | Main Output= %.4fV | Torr=%.4f\r\n"
+        "      Feed Back:%s cal=%s cal_ref=%.1fV | ADC_AIN2= %.4fV | Offset= %.6fV \r\n"
+        "      SHT31_T= %.2fC RH= %.1f%% | ADC_T= %.2fC\r\n",
+        (long)dec_sensor,
+        (long)g_dec_filt,
+
+        VIEW_BITS_1, (long)view_raw_1,        
+        VIEW_BITS_1, (long)view_filt_1,        
+
+        VIEW_BITS_2, (long)view_raw_2,         
+        VIEW_BITS_2, (long)view_filt_2,
+            
+        VIEW_BITS_3, (long)view_raw_3,         
+        VIEW_BITS_3, (long)view_filt_3,    
+
+        (double)(v_adc_sensor * 1000.0f),
+
+        (double)v_dac_raw,
+        (double)(v_dac_raw * OPAMP_GAIN),
+        (double)g_torr_est,
+            
+        fb_valid_str,
+        fb_cal_str,
+        (double)FB_CAL1_REF_TORR_DEBUG,
+        (double)v_adc_fb,
+        (double)off_v,            
+            
+        (double)t_ref,
+        (double)rh_ref,
+        (double)v_temp
+    );
+}
+
+
+/* =================================================================
+ * main
+ * ================================================================= */
+int main(void)
+{
+    SYSTEM_Initialize();
+    UART1_Initialize();
+    SPI1_Initialize();   // ★ ADC(SGM)
+    SPI2_Initialize();   // ★ DAC
+    I2C1_Initialize();
+
+    /* LED 핀 초기화 */
+    LED1_TRIS = 0;
+    LED2_TRIS = 0;
+    LED3_TRIS = 0;
+
+    LED1_Off();
+    LED2_Off();
+    LED3_Off();
+
+    /* SGM DRDY 핀 초기화 (보드에 맞게 조정) */
+    SGM_DRDY_TRIS = 1;
+
+#ifdef ANSELAbits
+    ANSELAbits.ANSA0 = 0; // 필요시 RA0를 디지털로
+#elif defined(ANSELA)
+    ANSELA &= ~(1u<<0);
+#endif
+
+#ifdef SGM_NCS_TRIS
+    /* ADC CS 핀 항상 LOW로 유지 (하드웨어 설계에 따라 다를 수 있음) */
+    SGM_NCS_TRIS = 0;
+    SGM_NCS_LAT  = 0;
+#endif
+
+    DAC_SPI_Init();
+
+    __delay_ms(10);
+
+#if (DAC_BOOT_TEST_MV >= 0)
+    DAC_WriteCode16(Dac_code_from_mV((uint16_t)DAC_BOOT_TEST_MV, VREF_MV));
+#endif
+
+    /* SGM Single-Shot 초기화 */
+    SGM_Init_SingleShot();
+
+    /* 부팅 시 0.25V → 1.0V 기준 1점 CAL 수행 (Torr 무관) */
+    Feedback_BootCal_1V();
+
+    /* 매핑 정보 출력 */
+    printf("Torr range = %.3f ~ %.3f \r\n", (double)TORR_DAC_MIN, (double)TORR_DAC_MAX);
+    printf("DAC VREF = %.3f V, OPAMP_GAIN = %.3f x  -> OPAMP FS ≈ %.3f V (maps to max Torr %.3f)\r\n",
+           (double)VREF_V, (double)OPAMP_GAIN, (double)(VREF_V * OPAMP_GAIN), (double)TORR_DAC_MAX);
+    printf("Feedback mode: CAL1 only (auto-offset disabled)\r\n");
+    printf("CAL1(1V) enable=%d, ref=%.1fTorr, tol=%.1fTorr, stable=%ums, apply<=%.1fTorr\r\n",
+           FB_CAL1_ENABLE,
+           (double)FB_CAL1_REF_TORR,
+           (double)FB_CAL1_REF_TORR_TOL,
+           (unsigned)FB_CAL1_STABLE_TIME_MS,
+           (double)FB_CAL1_APPLY_MAX_TORR);
+    printf("RAW discard count = %u, median=%s (window=%d)\r\n",
+           (unsigned)RAW_DISCARD_COUNT,
+           RAW_MEDIAN_ENABLE ? "ON" : "OFF",
+           (int)RAW_MEDIAN_WINDOW);
+
+#if DEMO_OUTPUT_SEQUENCE_ENABLE
+    /* 필요 시 부팅 직후 1V->0.5V->0.1V 데모 출력 */
+    DEMO_Output_1V_0p5V_0p1V();
+#endif
+
+    while (1) {
+        process_sensor_measurements();
+
+        __delay_ms(1000);   // 실측 주기
+        g_elapsed_ms += SAMPLE_PERIOD_MS;
+        if (!g_filter_active && g_elapsed_ms >= FILTER_DELAY_MS) {
+            g_filter_active = true;
+        }
+    }
+    return 0;
+}
